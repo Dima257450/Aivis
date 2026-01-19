@@ -1,0 +1,277 @@
+import sys, os, csv, cv2, datetime
+import numpy as np
+from PyQt5.QtWidgets import *
+from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QPoint
+from PyQt5.QtGui import QImage, QPixmap, QFont, QColor, QPainter, QBrush, QPolygon
+
+DB, IMG_DIR = 'operators_db.csv', 'operators'
+C_GN, C_PP, C_GR, C_DK = "#4CD964", "#8E44AD", "#E6E6E6", "#2E2E2E"
+
+HAND_PATH_1 = r"C:\Users\User\Desktop\Olimp\1.png"
+HAND_PATH_2 = r"C:\Users\User\Desktop\Olimp\2.png"
+# ----------------------------------
+
+def style(t):
+    b = "QPushButton { border-radius: %s; font-family: Arial; font-weight: bold; padding: %s; %s }"
+    if t=='m_act': return b%("15px","5px",f"background:{C_GN};color:white;border:none")
+    if t=='m_in': return b%("15px","5px",f"background:{C_PP};color:white;border:none")
+    if t=='dk': return b%("5px","8px","background:#333;color:white;min-width:100px;font-size:14px")
+    return b%("5px","8px","background:#A9A9A9;color:#505050;border:none;min-width:100px;font-size:14px")
+
+S_INP = "QLineEdit { border: 1px solid #ccc; padding: 5px; font-family: 'Times New Roman'; font-size: 18px; background: white; }"
+S_TRM = "QTextEdit { background: black; color: #E0E0E0; font-family: Consolas; font-size: 14px; border: none; }"
+
+def db(m, d=None, oid=None):
+    os.makedirs(IMG_DIR, exist_ok=True)
+    if not os.path.exists(DB): open(DB,'w',encoding='utf-8',newline='').write('id;last_name;first_name;middle_name;age;date;time;software_start_time;drive_duration;pulse_thresh;pulse_norm;cur_pulse\n')
+    rows = list(csv.reader(open(DB,encoding='utf-8'),delimiter=';')) if os.path.exists(DB) else []
+    if m=='id': return max([int(r[0]) for r in rows[1:] if r and r[0].isdigit()] or [128034])+1
+    if m=='save': csv.writer(open(DB,'a',newline='',encoding='utf-8'),delimiter=';').writerow(d+[""]*3)
+    # ИСПРАВЛЕНИЕ: Добавлено ", None" в конец next(...)
+    if m=='get': return next(((r+[""]*12)[:12] for r in rows[1:] if r[0]==str(oid)), None)
+    if m=='upd':
+        for r in rows:
+            if r and r[0]==str(oid): r[9:12] = d; break
+        csv.writer(open(DB,'w',newline='',encoding='utf-8'),delimiter=';').writerows(rows)
+
+def L(t, s=12, b=False, a=Qt.AlignLeft, c="black", bg=None):
+    l = QLabel(str(t)); l.setFont(QFont("Times New Roman",s,QFont.Bold if b else QFont.Normal))
+    l.setAlignment(a); l.setStyleSheet(f"color:{c};"+(f"background:{bg};" if bg else "")); return l
+def B(t, s, f=None, en=True):
+    b = QPushButton(t); b.setStyleSheet(style(s)); b.setEnabled(en)
+    if f: b.clicked.connect(f)
+    return b
+
+class Shape(QWidget):
+    def __init__(self, t, c): super().__init__(); self.setFixedSize(60,60); self.t, self.c = t, QColor(c)
+    def paintEvent(self, e):
+        p=QPainter(self); p.setRenderHint(QPainter.Antialiasing); p.setBrush(QBrush(self.c)); p.setPen(Qt.NoPen); r=self.rect().adjusted(5,5,-5,-5)
+        if self.t=="circle": p.drawEllipse(r)
+
+class Cam(QThread):
+    pix, det = pyqtSignal(QImage), pyqtSignal(object)
+    def __init__(self): super().__init__(); self.go, self.mode, self.ref = True, "detect", None; self.casc = cv2.CascadeClassifier(cv2.data.haarcascades+'haarcascade_frontalface_default.xml')
+    def run(self):
+        self.go = True # !!! ВАЖНО: Сбрасываем флаг при старте, чтобы перезапуск работал !!!
+        cap = cv2.VideoCapture(0)
+        while self.go:
+            ret, fr = cap.read()
+            if not ret: continue
+            fr = cv2.flip(fr,1); gray = cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY)
+            faces = self.casc.detectMultiScale(gray,1.2,5); face = None
+            for (x,y,w,h) in faces:
+                cv2.rectangle(fr,(x,y),(x+w,y+h),(0,255,0),2); face = fr[y:y+h, x:x+w]
+            if face is not None:
+                if self.mode=="detect": self.det.emit(face)
+                elif self.mode=="verify" and self.ref is not None:
+                    if self.cmp(self.ref, face) > 0.75: self.det.emit(True)
+            rgb = cv2.cvtColor(fr, cv2.COLOR_BGR2RGB); h,w,ch = rgb.shape
+            self.pix.emit(QImage(rgb.data,w,h,ch*w,QImage.Format_RGB888).scaled(400,300,Qt.KeepAspectRatio))
+        cap.release()
+    def cmp(self, i1, i2):
+        try:
+            sz=(64,64); g1 = cv2.GaussianBlur(cv2.cvtColor(cv2.resize(i1,sz),cv2.COLOR_BGR2GRAY),(5,5),0)
+            g2 = cv2.GaussianBlur(cv2.cvtColor(cv2.resize(i2,sz),cv2.COLOR_BGR2GRAY),(5,5),0)
+            h1 = cv2.calcHist([g1],[0],None,[256],[0,256]); h2 = cv2.calcHist([g2],[0],None,[256],[0,256])
+            cv2.normalize(h1,h1,0,1,cv2.NORM_MINMAX); cv2.normalize(h2,h2,0,1,cv2.NORM_MINMAX)
+            return (cv2.compareHist(h1,h2,cv2.HISTCMP_CORREL) + cv2.matchTemplate(g1,g2,cv2.TM_CCOEFF_NORMED)[0][0])/2
+        except: return 0
+    def stop(self): self.go=False; self.wait()
+
+class Start(QDialog):
+    def __init__(self):
+        super().__init__(); self.setWindowTitle("Меню"); self.setFixedSize(500,300); self.setStyleSheet("background:#DCDCDC;")
+        l=QVBoxLayout(self); l.addWidget(L("Выберите необходимые\nдействия",22,1,Qt.AlignCenter))
+        h=QHBoxLayout(); h.setSpacing(30); b1,b2=QPushButton("Регистрация"),QPushButton("Авторизация")
+        for b in [b1,b2]: b.setFixedSize(180,60); b.setStyleSheet("background:#2E2E2E;color:white;border-radius:5px;font-size:14px"); h.addWidget(b)
+        l.addLayout(h); b1.clicked.connect(lambda:(self.close(), RegWin().show())); b2.clicked.connect(self.auth)
+    def auth(self):
+        d=QDialog(self); d.setWindowTitle("Вход"); d.setFixedSize(450,250); d.setStyleSheet("background:#DCDCDC;")
+        l=QVBoxLayout(d); l.addWidget(L("Авторизация оператора\nвведите ID",20,1,Qt.AlignCenter))
+        h,i,b=QHBoxLayout(),QLineEdit(),QPushButton("Авторизоваться"); i.setStyleSheet(S_INP); i.setFixedWidth(200)
+        b.setStyleSheet("background:#2E2E2E;color:white;padding:10px;"); b.clicked.connect(d.accept)
+        h.addStretch(); h.addWidget(i); h.addWidget(b); h.addStretch(); l.addLayout(h)
+        if d.exec_():
+            dt = db('get', oid=i.text())
+            (self.close(), InfoWin(dt, 'auth').show()) if dt else (QMessageBox.warning(self,"Ошибка","ID не найден"), self.show())
+
+class Base(QMainWindow):
+    def __init__(self):
+        super().__init__(); self.setFixedSize(1000,500); self.setStyleSheet("background:#DCDCDC;")
+        w=QWidget(); self.setCentralWidget(w); ml=QVBoxLayout(w); ml.setContentsMargins(0,0,0,0)
+        h=QWidget(); h.setFixedHeight(80); h.setStyleSheet(f"background:{C_GN};"); hl=QVBoxLayout(h)
+        hl.addWidget(L("НейроБодр",32,0,Qt.AlignCenter,"white")); hl.addWidget(L("Программа для мониторинга состояния водителей",14,0,Qt.AlignCenter,"white"))
+        ml.addWidget(h); cont=QWidget(); cl=QHBoxLayout(cont); cl.setContentsMargins(10,10,10,10); ml.addWidget(cont)
+        self.cols=[QFrame() for _ in range(3)]; self.cols[0].setFixedWidth(300); self.cols[2].setFixedWidth(300)
+        for i,c in enumerate(self.cols): cl.addWidget(c); (c.setStyleSheet("border-right:2px solid white;") if i<2 else None)
+        l2=QVBoxLayout(self.cols[1]); l2.addWidget(L("Идентификация",16,1,Qt.AlignCenter))
+        self.cam=QLabel(); self.cam.setFixedSize(380,280); self.cam.setStyleSheet("background:white;"); l2.addWidget(self.cam,0,Qt.AlignCenter); l2.addStretch()
+        self.th=Cam(); self.th.pix.connect(lambda i: self.cam.setPixmap(QPixmap.fromImage(i)))
+    def closeEvent(self,e): self.th.stop(); e.accept()
+    def next(self): InstrWin(getattr(self,'ud',getattr(self,'cur',None)),getattr(self,'mode','reg')).show(); self.close()
+    
+    # --- МЕТОД ПОВТОРА ---
+    def retry(self):
+        self.th.stop()
+        if QMessageBox.question(self,"?","Лицо не найдено. Повторить?",QMessageBox.Yes|QMessageBox.No)==QMessageBox.Yes:
+            # Сбрасываем статус визуально, чтобы пользователь видел реакцию
+            if hasattr(self, 'sl'): self.sl.setText("Ожидание..."); self.si.setText("⏳"); self.si.setStyleSheet("color:black")
+            if hasattr(self, 'ib'): self.ib.setStyleSheet("background:#808080;color:white;padding:5px;font-weight:bold;font-size:24px")
+            if hasattr(self, 'msg'): self.msg.setText("Смотрите в камеру")
+            self.th.start()
+            self.tmr.start(15000)
+        else: self.close(); Start().show()
+
+class RegWin(Base):
+    def __init__(self):
+        super().__init__(); self.mode='reg'; self.setWindowTitle("Регистрация"); self.wait_chk=False
+        l=QVBoxLayout(self.cols[0]); l.addWidget(L("Регистрация оператора",16,1,Qt.AlignCenter)); g=QGridLayout(); self.inps={}
+        for i,(t,k,v) in enumerate([("Фамилия","last_name","Иванов"),("Имя","first_name","Иван"),("Отчество","middle_name","Иванович"),("Возраст","age","18")]):
+            g.addWidget(L(t,14,1),i,0); self.inps[k]=QLineEdit(v); self.inps[k].setStyleSheet(S_INP); g.addWidget(self.inps[k],i,1)
+        l.addLayout(g); self.bs=B("Записать",'dk',self.pre_save); l.addWidget(self.bs,0,Qt.AlignRight)
+        l3=QVBoxLayout(self.cols[2]); l3.addWidget(L("Информационный блок",16,1,Qt.AlignCenter)); l3.addSpacing(20)
+        self.st_t, self.st_i = L("Оператор не определен",16), L("❌",24,0,c="red"); h=QHBoxLayout(); h.addWidget(self.st_t); h.addWidget(self.st_i); l3.addLayout(h)
+        self.id_l=L("ID не присвоен",24,1,Qt.AlignCenter,"black","red"); self.id_l.setContentsMargins(5,5,5,5); l3.addWidget(self.id_l)
+        self.msg=L("Запуск программы\nневозможен",16); l3.addWidget(self.msg); l3.addStretch(); self.bn=B("Далее",'dis',self.next,False); l3.addWidget(self.bn,0,Qt.AlignRight)
+        self.th.det.connect(self.face_h); self.th.start()
+    def pre_save(self):
+        if not all(i.text() for i in self.inps.values()): return QMessageBox.warning(self,"Ошибка","Заполните все!")
+        self.wait_chk=True; self.bs.setEnabled(False); self.msg.setText("Смотрите в камеру...")
+    def face_h(self, img):
+        if not self.wait_chk or not isinstance(img,np.ndarray): return
+        self.wait_chk=False; ex=self.chk(img)
+        if ex: QMessageBox.critical(self,"Ошибка",f"Уже есть: ID {ex}"); self.bs.setEnabled(True); self.msg.setText("Дубликат!"); return
+        self.cid=db('id'); now=datetime.datetime.now()
+        self.cur=[str(self.cid),self.inps['last_name'].text(),self.inps['first_name'].text(),self.inps['middle_name'].text(),self.inps['age'].text(),now.strftime("%d.%m.%Y"),now.strftime("%H:%M:%S"),now.strftime("%H:%M:%S"),"00:00:00"]
+        db('save',self.cur); cv2.imwrite(f"{IMG_DIR}/ID_{self.cid}.jpg",img); self.th.stop()
+        self.st_t.setText("Оператор определен"); self.st_i.setText("✅"); self.st_i.setStyleSheet("color:green;font-size:24px")
+        self.id_l.setText(f"ID {self.cid}"); self.id_l.setStyleSheet("background:#0F0;padding:5px;font-weight:bold;font-size:24px")
+        self.msg.setText("Успешно"); self.bn.setEnabled(True); self.bn.setStyleSheet(style('dk'))
+    def chk(self, face):
+        for f in os.listdir(IMG_DIR):
+            try: 
+                if self.th.cmp(cv2.imread(os.path.join(IMG_DIR,f)), face) > 0.65: return f.replace("ID_","").replace(".jpg","")
+            except: pass
+
+class InfoWin(Base):
+    def __init__(self, d, mode):
+        super().__init__(); self.setWindowTitle("Информация"); self.ud=d; self.mode=mode
+        l=QVBoxLayout(self.cols[0]); l.addWidget(L("Информация оператора",16,1,Qt.AlignCenter))
+        h,av=QHBoxLayout(),QLabel(); p=f"{IMG_DIR}/ID_{d[0]}.jpg"
+        if os.path.exists(p): av.setPixmap(QPixmap(p).scaled(80,100,Qt.KeepAspectRatio))
+        h.addWidget(av); v=QVBoxLayout(); v.addWidget(L(f"{d[1]} {d[2]}\n{d[3]}",18,1)); v.addWidget(L(f"{d[4]} лет",16)); h.addLayout(v); l.addLayout(h)
+        g=QGridLayout(); self.dl=L("",14); g.addWidget(L("Дата/время:",14,1),0,0); g.addWidget(self.dl,0,1)
+        for i,(t,v) in enumerate(zip(["Старт ПО:","В дороге:","Осталось:"],[d[7],d[8],"09:00:00"])): g.addWidget(L(t,14,1),i+1,0); g.addWidget(L(v,14),i+1,1)
+        l.addLayout(g); l.addStretch(); t=QTimer(self); t.timeout.connect(lambda:self.dl.setText(datetime.datetime.now().strftime("%d.%m.%Y / %H:%M:%S"))); t.start(1000)
+        l3=QVBoxLayout(self.cols[2]); l3.addWidget(L("Информационный блок",16,1,Qt.AlignCenter)); l3.addSpacing(20)
+        hs=QHBoxLayout(); self.sl,self.si=L("Ожидание...",16),L("⏳",24); hs.addWidget(self.sl); hs.addWidget(self.si); l3.addLayout(hs)
+        self.ib=L(f"ID {d[0]}",24,1,Qt.AlignCenter,"white","#808080"); self.ib.setContentsMargins(5,5,5,5); l3.addWidget(self.ib)
+        self.msg=L("Смотрите в камеру",16); l3.addWidget(self.msg); l3.addStretch(); self.bn=B("Далее",'dis',self.next,False); l3.addWidget(self.bn,0,Qt.AlignRight)
+        self.lt=QTimer(self); self.lt.setInterval(1500); self.lt.timeout.connect(self.rst)
+        self.tmr=QTimer(self); self.tmr.setSingleShot(True); self.tmr.timeout.connect(self.retry)
+        if os.path.exists(p): 
+            self.th.ref, self.th.mode = cv2.imread(p), "verify"
+            self.th.det.connect(self.ok); self.th.start(); self.tmr.start(15000)
+    def ok(self, s):
+        if s is True or (isinstance(s,float) and s>0.55):
+            self.tmr.stop(); self.lt.start()
+            if not self.bn.isEnabled():
+                self.sl.setText("Подтвержден"); self.si.setText("✅"); self.si.setStyleSheet("color:green")
+                self.ib.setStyleSheet("background:#0F0;color:black;padding:5px;font-weight:bold;font-size:24px")
+                self.msg.setText("Доступ разрешен"); self.bn.setEnabled(True); self.bn.setStyleSheet(style('dk'))
+    def rst(self):
+        self.lt.stop(); self.sl.setText("Потерян..."); self.si.setText("❌"); self.si.setStyleSheet("color:red")
+        self.ib.setStyleSheet("background:#808080;color:white;padding:5px;font-weight:bold;font-size:24px")
+        self.msg.setText("Вернитесь в кадр!"); self.bn.setEnabled(False); self.bn.setStyleSheet(style('dis'))
+
+class ModBase(QMainWindow):
+    def __init__(self, d, idx):
+        super().__init__(); self.setFixedSize(1000,500); self.setStyleSheet("background:white;"); self.d=d
+        w=QWidget(); self.setCentralWidget(w); ml=QVBoxLayout(w); ml.setContentsMargins(0,0,0,0); ml.setSpacing(5)
+        top=QFrame(); top.setFixedHeight(90); th=QHBoxLayout(top); th.setContentsMargins(0,0,0,0); th.setSpacing(5)
+        f1=QFrame(); f1.setStyleSheet(f"background:{C_GR};"); l1=QVBoxLayout(f1); l1.setContentsMargins(10,5,10,5)
+        l1.addWidget(L("Меню управления",16,0,Qt.AlignCenter)); hb=QHBoxLayout(); hb.setSpacing(5)
+        for i,t in enumerate(["Инструкция","Анализ","Управление"]): b=B(t,'m_act' if i==idx else 'm_in'); b.setFixedHeight(30); hb.addWidget(b)
+        l1.addLayout(hb); f2=QFrame(); f2.setStyleSheet(f"background:{C_GN};"); l2=QVBoxLayout(f2); l2.setAlignment(Qt.AlignCenter)
+        tl=L("Нейрободр",24,0,Qt.AlignCenter,"white"); tl.setStyleSheet("color:white;border-bottom:2px solid white;")
+        l2.addWidget(tl); l2.addWidget(L("Мониторинг состояния",12,0,Qt.AlignCenter,"white"))
+        f3=QFrame(); f3.setStyleSheet(f"background:{C_GR};"); l3=QVBoxLayout(f3); l3.addWidget(L("Идентификация",16,0,Qt.AlignCenter))
+        ln=QFrame(); ln.setFrameShape(QFrame.HLine); ln.setStyleSheet("color:white;"); l3.addWidget(ln)
+        hl3=QHBoxLayout(); hl3.addWidget(L("Оператор:",14)); hl3.addWidget(L(f"{d[1]} {d[2]}" if d else "?",18,0,Qt.AlignCenter)); l3.addLayout(hl3)
+        th.addWidget(f1,35); th.addWidget(f2,35); th.addWidget(f3,30); ml.addWidget(top); self.cont=QWidget(); ml.addWidget(self.cont)
+
+class InstrWin(ModBase):
+    def __init__(self, d, mode):
+        super().__init__(d, 0); self.mode=mode; h=QHBoxLayout(self.cont); h.setContentsMargins(0,0,0,0); l,r=QFrame(),QFrame()
+        l.setStyleSheet(f"background:{C_GR}"); r.setStyleSheet(f"background:{C_GR}"); ll,rl=QVBoxLayout(l),QVBoxLayout(r)
+        
+        # Левая часть (Текст + фигуры)
+        ll.addWidget(L("Инструкция",20,1,Qt.AlignCenter,"black","#E0E0E0"),0,Qt.AlignTop); cw=QWidget(); cl=QVBoxLayout(cw); cl.setSpacing(15)
+        for s,c,t in [("circle","#40E0D0","Зеленый индикатор на видео означает, хорошее состояние оператора. Оператор бодрствует. ЧСС в пределах нормы. “Норма”"),("circle","#FFD700","Желтый индикатор на видео означает “Внимание” состояние оператора выходит за пределы нормы: Падение ЧСС ниже 50 уд./мин или выше не более 90 уд./мин Веки закрыты дольше 3 секунд (микросон). Наклон вперед/вбок эффект кивающей головы"),("circle","#DC143C","Красный индикатор на видео означает, “Критическое” состояние: ЧСС 38–42 уд./мин в минуту и ниже ЧСС больше 100–130 ударов Наклон головы вперед/вбок (дольше 4 секунд) веки закрыты")]:
+            rw=QHBoxLayout(); rw.addWidget(Shape(s,c)); lbl=L(t,14); lbl.setWordWrap(True); rw.addWidget(lbl); cl.addLayout(rw)
+        cl.addStretch(); ll.addWidget(cw); ll.addStretch()
+        
+        # Правая часть (Картинки)
+        rl.addWidget(L("Вид подключения",20,1,Qt.AlignCenter,"black","#E0E0E0")); rl.addStretch()
+        
+        # --- КАРТИНКИ (ИСПРАВЛЕНО И РАСКОММЕНТИРОВАНО) ---
+        hbox = QHBoxLayout(); hbox.addStretch()
+        # Если пути не заданы в начале файла, добавьте проверку или раскомментируйте их там
+        try:
+            # Убедитесь, что переменные HAND_PATH_1 и HAND_PATH_2 объявлены в начале файла!
+            for p in [HAND_PATH_1, HAND_PATH_2]:
+                im = QLabel() # Используем im вместо l, чтобы не сломать левую панель
+                im.setStyleSheet("background: white;"); im.setFixedSize(140, 160)
+                if os.path.exists(p): im.setPixmap(QPixmap(p).scaled(140, 160, Qt.KeepAspectRatio))
+                hbox.addWidget(im)
+        except: pass
+        hbox.addStretch(); rl.addLayout(hbox)
+        # ------------------------------------------------
+        
+        rl.addWidget(L("Наклеить электроды...",14,1,Qt.AlignCenter)); rl.addStretch()
+        rl.addWidget(B("Далее",'dk',lambda:(AnlsWin(self.d,self.mode).show(),self.close())),0,Qt.AlignRight)
+        
+        # Добавляем панели (l - это фрейм, а не картинка)
+        h.addWidget(l,65); h.addWidget(r,35)
+
+class AnlsWin(ModBase):
+    def __init__(self, d, mode):
+        super().__init__(d, 1); self.mode=mode; v=QVBoxLayout(self.cont); v.setContentsMargins(0,0,0,0); th=QHBoxLayout()
+        ana,con=QFrame(),QFrame(); ana.setStyleSheet(f"background:{C_GR}"); con.setStyleSheet(f"background:{C_GR}"); al,cl=QVBoxLayout(ana),QVBoxLayout(con)
+        
+        # Левая часть
+        al.addWidget(L("Анализ оператора",20,1,Qt.AlignCenter,"black","#E0E0E0")); il=QGridLayout(); self.it,self.iv=QLineEdit(),QLineEdit()
+        for i,(t,w) in enumerate([("Порог",self.it),("Норма",self.iv)]): il.addWidget(L(t,16),i,0); w.setFixedSize(100,30); w.setStyleSheet(S_INP); il.addWidget(w,i,1)
+        fw=QWidget(); fl=QHBoxLayout(fw); fl.addLayout(il); self.bs=B("Записать",'dk',self.save); fl.addWidget(self.bs); al.addWidget(fw); al.addStretch()
+        al.addWidget(L("Терминал",20,1,Qt.AlignCenter,"black","#DCDCDC")); self.tm=QTextEdit(); self.tm.setReadOnly(True); self.tm.setStyleSheet(S_TRM); al.addWidget(self.tm)
+        
+        # Правая часть
+        cl.addWidget(L("Подключение",20,1,Qt.AlignCenter,"black","#E0E0E0")); cl.addStretch()
+        
+        # --- КАРТИНКИ (ИСПРАВЛЕНО И РАСКОММЕНТИРОВАНО) ---
+        hb = QHBoxLayout(); hb.addStretch()
+        try:
+            for p in [HAND_PATH_1, HAND_PATH_2]:
+                im = QLabel() # Используем im
+                im.setStyleSheet("background: white;"); im.setFixedSize(100, 120)
+                if os.path.exists(p): im.setPixmap(QPixmap(p).scaled(100, 120, Qt.KeepAspectRatio))
+                hb.addWidget(im)
+        except: pass
+        hb.addStretch(); cl.addLayout(hb)
+        # ------------------------------------------------
+        
+        cl.addWidget(L("Наклеить электроды...",14,1,Qt.AlignCenter)); cl.addStretch()
+        self.bn=B("Далее",'dk',lambda:(QMessageBox.information(self,"Конец","Управление"),self.close()),False); cl.addWidget(self.bn,0,Qt.AlignRight)
+        
+        th.addWidget(ana,65); th.addWidget(con,35); v.addLayout(th)
+        if mode=='auth': self.it.setText(d[9] or ""); self.iv.setText(d[10] or ""); self.it.setReadOnly(True); self.iv.setReadOnly(True); self.bs.hide(); self.run_tm()
+    
+    def save(self):
+        if not self.it.text() or not self.iv.text(): return QMessageBox.warning(self,"!","Заполните")
+        db('upd',[self.it.text(),self.iv.text(),"0"],self.d[0]); self.bs.setEnabled(False); self.run_tm()
+    def run_tm(self): self.stp=0; self.t=QTimer(); self.t.timeout.connect(self.step); self.t.start(1000)
+    def step(self):
+        m=["Сигнал... OK","Пульс... OK",f"ЧСС... {self.iv.text() or '76'}","Готово"]; self.tm.append(m[self.stp]); self.stp+=1
+        if self.stp>=len(m): self.t.stop(); self.bn.setEnabled(True)
+
+if __name__=="__main__": db('?'); app=QApplication(sys.argv); Start().show(); sys.exit(app.exec_())
