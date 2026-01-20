@@ -1,0 +1,624 @@
+import sys
+import os
+import csv
+import cv2
+import datetime
+import numpy as np
+from PyQt5.QtWidgets import *
+from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QPoint
+from PyQt5.QtGui import QImage, QPixmap, QFont, QColor, QPainter, QBrush, QPolygon
+
+DB_FILE = 'operators_db.csv'
+IMG_FOLDER = 'operators'
+HAND_IMG_1 = '1.png'
+HAND_IMG_2 = '2.png'
+
+STYLE_BTN_GREEN = "background-color: #4CD964; color: white; border-radius: 5px; font-weight: bold; font-size: 14px;"
+STYLE_BTN_DARK = "background-color: #333; color: white; border-radius: 5px; font-weight: bold; font-size: 14px;"
+STYLE_BTN_DIS = "background-color: #A9A9A9; color: #505050; border-radius: 5px; font-weight: bold; font-size: 14px;"
+STYLE_INP = "border: 1px solid #ccc; padding: 5px; font-size: 14px;"
+
+def init_db():
+    if not os.path.exists(IMG_FOLDER):
+        os.makedirs(IMG_FOLDER)
+    if not os.path.exists(DB_FILE):
+        with open(DB_FILE, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f, delimiter=';')
+            writer.writerow(['id', 'last_name', 'first_name', 'middle_name', 'age', 'date', 'time', 'software_start_time', 'drive_duration', 'pulse_thresh', 'pulse_norm', 'cur_pulse', 'operator_status'])
+
+def get_next_id():
+    try:
+        with open(DB_FILE, 'r', encoding='utf-8') as f:
+            reader = csv.reader(f, delimiter=';')
+            rows = list(reader)
+            if len(rows) <= 1:
+                return 128035
+            ids = [int(row[0]) for row in rows[1:] if row]
+            return max(ids) + 1
+    except:
+        return 128035
+
+def save_operator(data):
+    with open(DB_FILE, 'a', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f, delimiter=';')
+        writer.writerow(data + ['', '', '', ''])
+
+def get_operator(op_id):
+    with open(DB_FILE, 'r', encoding='utf-8') as f:
+        reader = csv.reader(f, delimiter=';')
+        for row in reader:
+            if row and row[0] == str(op_id):
+                return row
+    return None
+
+def update_operator_pulse(op_id, thresh, norm):
+    rows = []
+    with open(DB_FILE, 'r', encoding='utf-8') as f:
+        rows = list(csv.reader(f, delimiter=';'))
+    
+    for row in rows:
+        if row and row[0] == str(op_id):
+            while len(row) < 13:
+                row.append('')
+            row[9] = thresh
+            row[10] = norm
+            
+    with open(DB_FILE, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f, delimiter=';')
+        writer.writerows(rows)
+
+class CameraThread(QThread):
+    image_data = pyqtSignal(QImage)
+    face_data = pyqtSignal(object)
+
+    def __init__(self):
+        super().__init__()
+        self.running = True
+        self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+    def run(self):
+        cap = cv2.VideoCapture(0)
+        while self.running:
+            ret, frame = cap.read()
+            if ret:
+                frame = cv2.flip(frame, 1)
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                faces = self.face_cascade.detectMultiScale(gray, 1.3, 5)
+                
+                face_img = None
+                for (x, y, w, h) in faces:
+                    cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                    face_img = frame[y:y+h, x:x+w]
+                
+                if face_img is not None:
+                    self.face_data.emit(face_img)
+
+                rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                h, w, ch = rgb_image.shape
+                bytes_per_line = ch * w
+                qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
+                self.image_data.emit(qt_image.scaled(400, 300, Qt.KeepAspectRatio))
+        cap.release()
+
+    def stop(self):
+        self.running = False
+        self.wait()
+
+class StartWindow(QDialog):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Окно№1")
+        self.setFixedSize(400, 200)
+        layout = QVBoxLayout()
+        
+        lbl = QLabel("Выберите необходимые\nдействия")
+        lbl.setAlignment(Qt.AlignCenter)
+        lbl.setFont(QFont("Arial", 14, QFont.Bold))
+        layout.addWidget(lbl)
+
+        btn_layout = QHBoxLayout()
+        self.btn_reg = QPushButton("Регистрация")
+        self.btn_reg.setStyleSheet(STYLE_BTN_DARK)
+        self.btn_reg.setFixedSize(150, 40)
+        self.btn_reg.clicked.connect(self.open_reg)
+
+        self.btn_auth = QPushButton("Авторизация")
+        self.btn_auth.setStyleSheet(STYLE_BTN_DARK)
+        self.btn_auth.setFixedSize(150, 40)
+        self.btn_auth.clicked.connect(self.open_auth_dialog)
+
+        btn_layout.addWidget(self.btn_reg)
+        btn_layout.addWidget(self.btn_auth)
+        layout.addLayout(btn_layout)
+        self.setLayout(layout)
+
+    def open_reg(self):
+        self.win = RegistrationWindow()
+        self.win.show()
+        self.close()
+
+    def open_auth_dialog(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Авторизация")
+        dialog.setFixedSize(300, 150)
+        dl = QVBoxLayout()
+        dl.addWidget(QLabel("Введите ID:"))
+        inp = QLineEdit()
+        dl.addWidget(inp)
+        btn = QPushButton("Авторизация")
+        btn.clicked.connect(lambda: self.check_auth(inp.text(), dialog))
+        dl.addWidget(btn)
+        dialog.setLayout(dl)
+        dialog.exec_()
+
+    def check_auth(self, op_id, dialog):
+        data = get_operator(op_id)
+        if data:
+            dialog.close()
+            self.win = AuthorizationWindow(data)
+            self.win.show()
+            self.close()
+        else:
+            QMessageBox.warning(self, "Ошибка", "ID не найден")
+
+class BaseWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setFixedSize(1000, 600)
+        self.central_widget = QWidget()
+        self.setCentralWidget(self.central_widget)
+        self.main_layout = QVBoxLayout(self.central_widget)
+        
+        header = QFrame()
+        header.setStyleSheet("background-color: #4CD964;")
+        header.setFixedHeight(80)
+        hl = QVBoxLayout(header)
+        title = QLabel("Нейрободр")
+        title.setStyleSheet("color: white; font-size: 24px; font-weight: bold;")
+        title.setAlignment(Qt.AlignCenter)
+        sub = QLabel("Программа для мониторинга состояния водителей")
+        sub.setStyleSheet("color: white; font-size: 12px;")
+        sub.setAlignment(Qt.AlignCenter)
+        hl.addWidget(title)
+        hl.addWidget(sub)
+        self.main_layout.addWidget(header)
+        
+        self.content_layout = QHBoxLayout()
+        self.main_layout.addLayout(self.content_layout)
+
+class RegistrationWindow(BaseWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Форма№1 Регистрация")
+        self.detected_face = None
+
+        col1 = QFrame()
+        l1 = QVBoxLayout(col1)
+        l1.addWidget(QLabel("Регистрация оператора"))
+        
+        self.inputs = {}
+        fields = [("Фамилия", "Иванов"), ("Имя", "Иван"), ("Отчество", "Иванович"), ("Возраст", "18")]
+        for lbl, pl in fields:
+            l1.addWidget(QLabel(lbl))
+            inp = QLineEdit()
+            inp.setPlaceholderText(pl)
+            inp.setStyleSheet(STYLE_INP)
+            l1.addWidget(inp)
+            self.inputs[lbl] = inp
+        
+        btn_save = QPushButton("Записать")
+        btn_save.setStyleSheet(STYLE_BTN_DARK)
+        btn_save.clicked.connect(self.save_data)
+        l1.addWidget(btn_save)
+        l1.addStretch()
+
+        col2 = QFrame()
+        l2 = QVBoxLayout(col2)
+        l2.addWidget(QLabel("Идентификация"))
+        self.cam_lbl = QLabel()
+        self.cam_lbl.setFixedSize(400, 300)
+        self.cam_lbl.setStyleSheet("background-color: black;")
+        l2.addWidget(self.cam_lbl)
+        l2.addStretch()
+
+        col3 = QFrame()
+        l3 = QVBoxLayout(col3)
+        l3.addWidget(QLabel("Информационный блок"))
+        
+        self.status_lbl = QLabel("Оператор не определен")
+        self.icon_lbl = QLabel("❌")
+        self.icon_lbl.setStyleSheet("color: red; font-size: 20px;")
+        
+        hl = QHBoxLayout()
+        hl.addWidget(self.status_lbl)
+        hl.addWidget(self.icon_lbl)
+        l3.addLayout(hl)
+
+        self.id_display = QLabel("ID ...")
+        self.id_display.setStyleSheet("background-color: #ddd; padding: 10px; font-weight: bold;")
+        self.id_display.setAlignment(Qt.AlignCenter)
+        l3.addWidget(self.id_display)
+        
+        self.msg_lbl = QLabel("Для запуска программы\nнажмите 'Далее'")
+        l3.addWidget(self.msg_lbl)
+        
+        self.btn_next = QPushButton("Далее")
+        self.btn_next.setStyleSheet(STYLE_BTN_DIS)
+        self.btn_next.setEnabled(False)
+        self.btn_next.clicked.connect(self.go_next)
+        l3.addWidget(self.btn_next)
+        l3.addStretch()
+
+        self.content_layout.addWidget(col1)
+        self.content_layout.addWidget(col2)
+        self.content_layout.addWidget(col3)
+
+        self.thread = CameraThread()
+        self.thread.image_data.connect(self.update_image)
+        self.thread.face_data.connect(self.update_face)
+        self.thread.start()
+
+    def update_image(self, image):
+        self.cam_lbl.setPixmap(QPixmap.fromImage(image))
+
+    def update_face(self, face):
+        self.detected_face = face
+
+    def save_data(self):
+        if not self.detected_face is not None:
+            QMessageBox.warning(self, "Ошибка", "Лицо не обнаружено")
+            return
+        
+        op_id = get_next_id()
+        lname = self.inputs["Фамилия"].text()
+        fname = self.inputs["Имя"].text()
+        mname = self.inputs["Отчество"].text()
+        age = self.inputs["Возраст"].text()
+        
+        if not all([lname, fname, age]):
+            QMessageBox.warning(self, "Ошибка", "Заполните поля")
+            return
+
+        now = datetime.datetime.now()
+        date_str = now.strftime("%d.%m.%Y")
+        time_str = now.strftime("%H:%M:%S")
+        
+        data = [str(op_id), lname, fname, mname, age, date_str, time_str, time_str, "00:00:00"]
+        save_operator(data)
+        
+        cv2.imwrite(os.path.join(IMG_FOLDER, f"ID_{op_id}.jpg"), self.detected_face)
+        
+        self.status_lbl.setText("Оператор определен")
+        self.icon_lbl.setText("✅")
+        self.icon_lbl.setStyleSheet("color: green; font-size: 20px;")
+        self.id_display.setText(f"ID {op_id}")
+        self.id_display.setStyleSheet("background-color: #4CD964; padding: 10px; font-weight: bold;")
+        self.btn_next.setEnabled(True)
+        self.btn_next.setStyleSheet(STYLE_BTN_DARK)
+        self.operator_data = data
+
+    def go_next(self):
+        self.thread.stop()
+        self.win = InstructionWindow(self.operator_data)
+        self.win.show()
+        self.close()
+
+class AuthorizationWindow(BaseWindow):
+    def __init__(self, data):
+        super().__init__()
+        self.setWindowTitle("Форма№2 Авторизация")
+        self.data = data
+        self.op_id = data[0]
+
+        col1 = QFrame()
+        l1 = QVBoxLayout(col1)
+        l1.addWidget(QLabel("Информация оператора"))
+        
+        photo_path = os.path.join(IMG_FOLDER, f"ID_{self.op_id}.jpg")
+        photo_lbl = QLabel()
+        if os.path.exists(photo_path):
+            pix = QPixmap(photo_path).scaled(100, 100, Qt.KeepAspectRatio)
+            photo_lbl.setPixmap(pix)
+        l1.addWidget(photo_lbl)
+        
+        l1.addWidget(QLabel(f"{data[1]} {data[2]}\n{data[3]}\n{data[4]} лет"))
+        
+        grid = QGridLayout()
+        grid.addWidget(QLabel("Дата/время:"), 0, 0)
+        self.time_lbl = QLabel()
+        grid.addWidget(self.time_lbl, 0, 1)
+        grid.addWidget(QLabel("Время запуска:"), 1, 0)
+        grid.addWidget(QLabel(data[7]), 1, 1)
+        l1.addLayout(grid)
+        l1.addStretch()
+
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_time)
+        self.timer.start(1000)
+
+        col2 = QFrame()
+        l2 = QVBoxLayout(col2)
+        l2.addWidget(QLabel("Идентификация"))
+        self.cam_lbl = QLabel()
+        self.cam_lbl.setFixedSize(400, 300)
+        self.cam_lbl.setStyleSheet("background-color: black;")
+        l2.addWidget(self.cam_lbl)
+        l2.addStretch()
+
+        col3 = QFrame()
+        l3 = QVBoxLayout(col3)
+        l3.addWidget(QLabel("Информационный блок"))
+        self.res_lbl = QLabel("Ожидание...")
+        self.id_box = QLabel(f"ID {self.op_id}")
+        self.id_box.setStyleSheet("background-color: #ddd; padding: 10px;")
+        self.id_box.setAlignment(Qt.AlignCenter)
+        
+        l3.addWidget(self.res_lbl)
+        l3.addWidget(self.id_box)
+        
+        self.btn_next = QPushButton("Далее")
+        self.btn_next.setStyleSheet(STYLE_BTN_DIS)
+        self.btn_next.setEnabled(False)
+        self.btn_next.clicked.connect(self.go_next)
+        l3.addWidget(self.btn_next)
+        l3.addStretch()
+
+        self.content_layout.addWidget(col1)
+        self.content_layout.addWidget(col2)
+        self.content_layout.addWidget(col3)
+
+        self.ref_img = cv2.imread(photo_path)
+        self.thread = CameraThread()
+        self.thread.image_data.connect(self.update_image)
+        self.thread.face_data.connect(self.verify_face)
+        self.thread.start()
+        
+        self.verified = False
+
+    def update_time(self):
+        self.time_lbl.setText(datetime.datetime.now().strftime("%d.%m.%Y / %H:%M:%S"))
+
+    def update_image(self, image):
+        self.cam_lbl.setPixmap(QPixmap.fromImage(image))
+
+    def verify_face(self, face):
+        if self.verified or self.ref_img is None: return
+
+        try:
+            gray1 = cv2.cvtColor(self.ref_img, cv2.COLOR_BGR2GRAY)
+            gray2 = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
+            hist1 = cv2.calcHist([gray1], [0], None, [256], [0, 256])
+            hist2 = cv2.calcHist([gray2], [0], None, [256], [0, 256])
+            cv2.normalize(hist1, hist1, 0, 1, cv2.NORM_MINMAX)
+            cv2.normalize(hist2, hist2, 0, 1, cv2.NORM_MINMAX)
+            score = cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)
+
+            if score > 0.5:
+                self.verified = True
+                self.res_lbl.setText("Оператор определен")
+                self.id_box.setStyleSheet("background-color: #4CD964; padding: 10px;")
+                self.btn_next.setEnabled(True)
+                self.btn_next.setStyleSheet(STYLE_BTN_DARK)
+        except:
+            pass
+
+    def go_next(self):
+        self.thread.stop()
+        self.win = InstructionWindow(self.data)
+        self.win.show()
+        self.close()
+
+class ShapeWidget(QWidget):
+    def __init__(self, shape_type, color):
+        super().__init__()
+        self.shape_type = shape_type
+        self.color = QColor(color)
+        self.setFixedSize(50, 50)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setBrush(QBrush(self.color))
+        painter.setPen(Qt.NoPen)
+        if self.shape_type == "circle":
+            painter.drawEllipse(0, 0, 50, 50)
+        elif self.shape_type == "triangle":
+            points = [QPoint(25, 0), QPoint(0, 50), QPoint(50, 50)]
+            painter.drawPolygon(QPolygon(points))
+        elif self.shape_type == "square":
+            painter.drawRect(0, 0, 50, 50)
+
+class ModuleBWindow(QMainWindow):
+    def __init__(self, data, active_tab=0):
+        super().__init__()
+        self.setFixedSize(1000, 600)
+        self.data = data
+        self.central_widget = QWidget()
+        self.setCentralWidget(self.central_widget)
+        self.main_layout = QVBoxLayout(self.central_widget)
+
+        top_panel = QFrame()
+        top_layout = QHBoxLayout(top_panel)
+        top_layout.setContentsMargins(0,0,0,0)
+        
+        menu_frame = QFrame()
+        ml = QVBoxLayout(menu_frame)
+        ml.addWidget(QLabel("Меню управления"))
+        btn_box = QHBoxLayout()
+        b1 = QPushButton("Инструкция")
+        b2 = QPushButton("Анализ")
+        b3 = QPushButton("Управление")
+        
+        style_act = STYLE_BTN_GREEN
+        style_inact = "background-color: #8E44AD; color: white; border-radius: 5px; border: none;"
+        
+        b1.setStyleSheet(style_act if active_tab == 0 else style_inact)
+        b2.setStyleSheet(style_act if active_tab == 1 else style_inact)
+        b3.setStyleSheet(style_inact) 
+        
+        btn_box.addWidget(b1)
+        btn_box.addWidget(b2)
+        btn_box.addWidget(b3)
+        ml.addLayout(btn_box)
+        
+        title_frame = QFrame()
+        title_frame.setStyleSheet("background-color: #4CD964;")
+        tl = QVBoxLayout(title_frame)
+        t1 = QLabel("Нейрободр")
+        t1.setStyleSheet("color: white; font-size: 20px; font-weight: bold;")
+        t1.setAlignment(Qt.AlignCenter)
+        t2 = QLabel("Программа для мониторинга")
+        t2.setStyleSheet("color: white;")
+        t2.setAlignment(Qt.AlignCenter)
+        tl.addWidget(t1)
+        tl.addWidget(t2)
+        
+        info_frame = QFrame()
+        il = QVBoxLayout(info_frame)
+        il.addWidget(QLabel("Идентификация"))
+        il.addWidget(QLabel(f"Оператор: {data[1]} {data[2]}"))
+        
+        top_layout.addWidget(menu_frame)
+        top_layout.addWidget(title_frame)
+        top_layout.addWidget(info_frame)
+        
+        self.main_layout.addWidget(top_panel)
+        self.content_area = QWidget()
+        self.main_layout.addWidget(self.content_area)
+
+class InstructionWindow(ModuleBWindow):
+    def __init__(self, data):
+        super().__init__(data, 0)
+        self.setWindowTitle("Форма№3 Инструкция")
+        
+        layout = QHBoxLayout(self.content_area)
+        
+        left = QFrame()
+        ll = QVBoxLayout(left)
+        ll.addWidget(QLabel("Инструкция"))
+        
+        items = [
+            ("circle", "#40E0D0", "Зеленый: Норма. ЧСС в норме."),
+            ("triangle", "#FFD700", "Желтый: Внимание. ЧСС <50 или >90."),
+            ("square", "#DC143C", "Красный: Критично! ЧСС <42 или >100.")
+        ]
+        
+        for s, c, t in items:
+            row = QHBoxLayout()
+            row.addWidget(ShapeWidget(s, c))
+            lbl = QLabel(t)
+            lbl.setWordWrap(True)
+            row.addWidget(lbl)
+            ll.addLayout(row)
+            
+        right = QFrame()
+        rl = QVBoxLayout(right)
+        rl.addWidget(QLabel("Вид подключения"))
+        
+        img_row = QHBoxLayout()
+        l_hand = QLabel()
+        r_hand = QLabel()
+        if os.path.exists(HAND_IMG_1): l_hand.setPixmap(QPixmap(HAND_IMG_1).scaled(100, 120))
+        if os.path.exists(HAND_IMG_2): r_hand.setPixmap(QPixmap(HAND_IMG_2).scaled(100, 120))
+        img_row.addWidget(l_hand)
+        img_row.addWidget(r_hand)
+        rl.addLayout(img_row)
+        
+        rl.addWidget(QLabel("Наклеить электроды как показано"))
+        btn = QPushButton("Далее")
+        btn.setStyleSheet(STYLE_BTN_DARK)
+        btn.clicked.connect(self.go_next)
+        rl.addWidget(btn)
+        
+        layout.addWidget(left)
+        layout.addWidget(right)
+
+    def go_next(self):
+        self.win = AnalysisWindow(self.data)
+        self.win.show()
+        self.close()
+
+class AnalysisWindow(ModuleBWindow):
+    def __init__(self, data):
+        super().__init__(data, 1)
+        self.setWindowTitle("Форма№4 Анализ")
+        
+        layout = QHBoxLayout(self.content_area)
+        
+        left = QFrame()
+        ll = QVBoxLayout(left)
+        ll.addWidget(QLabel("Анализ оператора"))
+        
+        grid = QGridLayout()
+        grid.addWidget(QLabel("Порог пульса"), 0, 0)
+        self.inp_thresh = QLineEdit()
+        grid.addWidget(self.inp_thresh, 0, 1)
+        
+        grid.addWidget(QLabel("Норма пульса"), 1, 0)
+        self.inp_norm = QLineEdit()
+        grid.addWidget(self.inp_norm, 1, 1)
+        
+        btn_rec = QPushButton("Записать")
+        btn_rec.setStyleSheet(STYLE_BTN_DARK)
+        btn_rec.clicked.connect(self.record_analysis)
+        grid.addWidget(btn_rec, 2, 1)
+        ll.addLayout(grid)
+        
+        ll.addWidget(QLabel("Терминальный блок информации"))
+        self.term = QTextEdit()
+        self.term.setStyleSheet("background-color: black; color: white;")
+        self.term.setReadOnly(True)
+        ll.addWidget(self.term)
+        
+        right = QFrame()
+        rl = QVBoxLayout(right)
+        rl.addWidget(QLabel("Вид подключения"))
+        
+        img_row = QHBoxLayout()
+        l_hand = QLabel()
+        r_hand = QLabel()
+        if os.path.exists(HAND_IMG_1): l_hand.setPixmap(QPixmap(HAND_IMG_1).scaled(80, 100))
+        if os.path.exists(HAND_IMG_2): r_hand.setPixmap(QPixmap(HAND_IMG_2).scaled(80, 100))
+        img_row.addWidget(l_hand)
+        img_row.addWidget(r_hand)
+        rl.addLayout(img_row)
+        
+        self.btn_next = QPushButton("Далее")
+        self.btn_next.setStyleSheet(STYLE_BTN_DIS)
+        self.btn_next.setEnabled(False)
+        self.btn_next.clicked.connect(self.finish)
+        rl.addWidget(self.btn_next)
+        
+        layout.addWidget(left)
+        layout.addWidget(right)
+        
+        if len(self.data) > 10 and self.data[9]:
+            self.inp_thresh.setText(self.data[9])
+            self.inp_norm.setText(self.data[10])
+
+    def record_analysis(self):
+        t = self.inp_thresh.text()
+        n = self.inp_norm.text()
+        if not t or not n:
+            QMessageBox.warning(self, "Ошибка", "Введите данные")
+            return
+            
+        update_operator_pulse(self.data[0], t, n)
+        self.term.append("Проверка сигнала... OK")
+        QTimer.singleShot(1000, lambda: self.term.append("Проверка пульса... OK"))
+        QTimer.singleShot(2000, lambda: self.term.append(f"Пульс... {n}"))
+        QTimer.singleShot(3000, self.enable_next)
+
+    def enable_next(self):
+        self.btn_next.setEnabled(True)
+        self.btn_next.setStyleSheet(STYLE_BTN_DARK)
+
+    def finish(self):
+        QMessageBox.information(self, "Инфо", "Модуль А и Б завершены")
+        self.close()
+
+if __name__ == "__main__":
+    init_db()
+    app = QApplication(sys.argv)
+    window = StartWindow()
+    window.show()
+    sys.exit(app.exec_())
