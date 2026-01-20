@@ -1,0 +1,200 @@
+Я вижу код программы мониторинга состояния водителей "НейроБодр" и документ с техническим заданием. Проанализирую код и требования из документа.
+
+## Основные проблемы в коде:
+
+### 1. **Критическая ошибка в последней строке:**
+```python
+if __name__=="__main__": db('?'); app=QApplication(sys.argv); Start().show
+```
+Должно быть:
+```python
+if __name__=="__main__": db('?'); app=QApplication(sys.argv); Start().show(); sys.exit(app.exec_())
+```
+
+### 2. **Проблема с чтением данных Arduino:**
+В `PulseThread.run()` есть попытка исправления парсинга, но логика слишком упрощена. Нужно:
+```python
+def run(self):
+    try:
+        ser = serial.Serial(ARDUINO_PORT, BAUD_RATE, timeout=1)
+        print(f"Arduino connected on {ARDUINO_PORT}")
+        
+        while self.running:
+            if ser.in_waiting > 0:
+                try:
+                    line = ser.readline().decode('utf-8', errors='ignore').strip()
+                    
+                    if line and line.replace(',', '').isdigit():
+                        # Берем первое значение, если разделено запятой
+                        val = int(line.split(',')[0])
+                        
+                        # Фильтрация адекватных значений пульса
+                        if 30 <= val <= 200:
+                            self.pulse_update.emit(val)
+                            
+                except (ValueError, IndexError) as e:
+                    print(f"Parse Error: {e}")
+                    
+    except serial.SerialException as e:
+        print(f"Connection Error: {e}")
+```
+
+### 3. **Логика состояний в ControlWin:**
+Согласно документу, пороги должны быть:
+- **ВНИМАНИЕ (WARNING)**: ЧСС < 50 или > 90, веки закрыты > 3 сек
+- **КРИТИЧНО (CRITICAL)**: ЧСС 38-42 или > 100-130, веки закрыты > 4 сек, голова опущена > 4 сек
+
+Исправленный код:
+```python
+def tick(self):
+    now = datetime.datetime.now()
+    self.lbl_dt.setText(now.strftime("%d.%m.%Y / %H:%M:%S"))
+    self.total_seconds -= 1
+    h, m, s = self.total_seconds//3600, (self.total_seconds%3600)//60, self.total_seconds%60
+    self.lbl_timer.setText(f"{h:02}:{m:02}:{s:02}")
+    
+    if getattr(self, '_cur_closed', False):
+        self.eyes_closed_time += 1
+    else:
+        self.eyes_closed_time = 0
+        
+    if getattr(self, '_cur_head', False):
+        self.head_down_time += 1
+    else:
+        self.head_down_time = 0
+
+    p = self.pulse
+    st = "NORMAL"
+    msg = "Состояние нормальное"
+    col = "green"
+    
+    # Проверка КРИТИЧНОГО состояния
+    if ((38 <= p <= 42) or (100 <= p <= 130) or 
+        self.eyes_closed_time > 4 or self.head_down_time > 4):
+        st, msg, col = "CRITICAL", "КРИТИЧНО! ОСТАНОВИТЕСЬ!", "red"
+    # Проверка ВНИМАНИЯ
+    elif ((p < 50 or p > 90) or self.eyes_closed_time > 3):
+        st, msg, col = "WARNING", "ВНИМАНИЕ! Выход за пределы", "#FFD700"
+
+    self.status = st
+    self.lbl_status.setText(st if st != "NORMAL" else "НОРМА")
+    self.lbl_status.setStyleSheet(f"color:{col}; font-weight:bold")
+    
+    # Логирование в терминал
+    if st != "NORMAL":
+        self.term.append(f"[{now.strftime('%H:%M:%S')}] {st}: Пульс={p}, Глаза={self.eyes_closed_time}с, Голова={self.head_down_time}с")
+        winsound.Beep(1500 if st == "WARNING" else 2500, 300)
+    
+    db('status', [st, p, f"{9-h:02}:{59-m:02}:{60-s:02}"], self.d[0])
+```
+
+### 4. **Обработка видео при остановке:**
+Ваша логика с `self.last_frame` правильная, но добавьте визуальное предупреждение:
+
+```python
+def update_road(self):
+    if self.status == "NORMAL":
+        ret, frame = self.cap_road.read()
+        if not ret: 
+            self.cap_road.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, frame = self.cap_road.read()
+        if not ret: 
+            frame = np.zeros((300, 500, 3), dtype=np.uint8)
+        self.last_frame = frame.copy()
+    else:
+        frame = self.last_frame.copy() if self.last_frame is not None else np.zeros((300, 500, 3), dtype=np.uint8)
+        # Добавляем мигающую рамку
+        cv2.rectangle(frame, (0, 0), (499, 299), 
+                     (0, 0, 255) if self.status == "CRITICAL" else (0, 215, 255), 
+                     5)
+
+    frame = cv2.resize(frame, (500, 300))
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (500, 60), (200, 200, 200), -1)
+    cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+    
+    color = (0, 255, 0) if self.status == "NORMAL" else ((0, 215, 255) if self.status == "WARNING" else (0, 0, 255))
+    
+    # Индикаторы состояния
+    if self.status == "NORMAL":
+        cv2.circle(frame, (30, 30), 20, color, -1)
+    elif self.status == "WARNING":
+        pts = np.array([[30, 10], [10, 50], [50, 50]], np.int32)
+        cv2.fillPoly(frame, [pts], color)
+    else:
+        cv2.rectangle(frame, (10, 10), (50, 50), color, -1)
+    
+    cv2.putText(frame, f"Pulse: {self.pulse}", (70, 40), 
+                cv2.FONT_HERSHEY_TRIPLEX, 1.0, color, 2)
+    
+    if self.status == "CRITICAL":
+        cv2.putText(frame, "STOP!", (150, 150), 
+                   cv2.FONT_HERSHEY_TRIPLEX, 2.5, (0, 0, 255), 5)
+
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    h, w, ch = rgb.shape
+    self.vid_lbl.setPixmap(QPixmap.fromImage(QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)))
+```
+
+### 5. **Обработка обнаружения глаз/головы в Cam:**
+```python
+def run(self):
+    self.go = True
+    cap = cv2.VideoCapture(0)
+    eyes_cnt = 0
+    head_cnt = 0
+    
+    while self.go:
+        ret, fr = cap.read()
+        if not ret:
+            continue
+            
+        fr = cv2.flip(fr, 1)
+        gray = cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY)
+        faces = self.face_casc.detectMultiScale(gray, 1.2, 5)
+        
+        df = None
+        ec = False
+        hd = False
+        
+        if len(faces) == 0:
+            head_cnt += 1
+        else:
+            head_cnt = 0
+            
+        for (x, y, w, h) in faces:
+            cv2.rectangle(fr, (x, y), (x+w, y+h), (0, 255, 0), 2)
+            df = fr[y:y+h, x:x+w]
+            
+            if self.eye_casc:
+                roi_gray = gray[y:y+h, x:x+w]
+                eyes = self.eye_casc.detectMultiScale(roi_gray, 1.1, 10, minSize=(20, 20))
+                
+                if len(eyes) == 0:
+                    eyes_cnt += 1
+                else:
+                    eyes_cnt = 0
+                    
+        # Порог увеличен до 10 кадров (~0.3 сек при 30 FPS)
+        if eyes_cnt > 10:
+            ec = True
+        if head_cnt > 10:
+            hd = True
+        
+        if df is not None:
+            if self.mode == "detect":
+                self.det.emit(df)
+            elif self.mode == "verify" and self.ref is not None:
+                if self.cmp(self.ref, df) > 0.65:
+                    self.det.emit(True)
+        
+        self.state_sig.emit(ec, hd)
+        
+        rgb = cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+        self.pix.emit(QImage(rgb.data, w, h, ch*w, QImage.Format_RGB888).scaled(400, 300, Qt.KeepAspectRatio))
+        
+    cap.release()
+```
+
+Эти исправления приведут программу в соответствие с техническим заданием и исправят основные баги!
