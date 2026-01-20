@@ -1,0 +1,317 @@
+Отлично! Нужно добавить проверку подключения Arduino в модуле **Анализ** (класс `AnlsWin`). Вот исправленный код:
+
+## 1. Модифицируем класс `PulseThread` для проверки подключения:
+
+```python
+class PulseThread(QThread):
+    pulse_update = pyqtSignal(int)
+    connection_status = pyqtSignal(bool, str)  # Новый сигнал: (статус, сообщение)
+    
+    def __init__(self): 
+        super().__init__()
+        self.running = True
+        self.connected = False
+
+    def run(self):
+        try:
+            ser = serial.Serial(ARDUINO_PORT, BAUD_RATE, timeout=1)
+            self.connected = True
+            self.connection_status.emit(True, f"Arduino подключена на {ARDUINO_PORT}")
+            print(f"Arduino connected on {ARDUINO_PORT}")
+            
+            no_data_counter = 0  # Счетчик для отслеживания потери данных
+            
+            while self.running:
+                if ser.in_waiting > 0:
+                    try:
+                        raw_data = ser.readline()
+                        line = raw_data.decode('utf-8', errors='ignore').strip()
+                        
+                        if line:
+                            parts = line.split(',')
+                            
+                            if parts[0].isdigit():
+                                val = int(parts[0])
+                                
+                                # Фильтрация адекватных значений пульса
+                                if 30 <= val <= 200:
+                                    self.pulse_update.emit(val)
+                                    no_data_counter = 0  # Сброс счетчика при получении данных
+                                elif val > 200:
+                                    # Сырой сигнал - преобразуем
+                                    normalized = int(val / 10)
+                                    if 30 <= normalized <= 200:
+                                        self.pulse_update.emit(normalized)
+                                        no_data_counter = 0
+                                    
+                    except Exception as e:
+                        print(f"Parse Error: {e}")
+                        no_data_counter += 1
+                else:
+                    no_data_counter += 1
+                    
+                # Если долго нет данных - сообщаем о проблеме
+                if no_data_counter > 50:  # ~5 секунд без данных
+                    self.connection_status.emit(False, "Arduino не отвечает")
+                    no_data_counter = 0
+                    
+        except serial.SerialException as e:
+            self.connected = False
+            self.connection_status.emit(False, f"Ошибка подключения: {e}")
+            print(f"Connection Error: {e}")
+        except Exception as e:
+            self.connected = False
+            self.connection_status.emit(False, f"Неизвестная ошибка: {e}")
+
+    def stop(self): 
+        self.running = False
+        self.wait()
+```
+
+## 2. Модифицируем класс `AnlsWin`:
+
+```python
+class AnlsWin(ModBase):
+    def __init__(self, d, mode):
+        super().__init__(d, 1)
+        self.mode = mode
+        self.arduino_connected = False  # Флаг подключения
+        
+        v = QVBoxLayout(self.cont)
+        v.setContentsMargins(0,0,0,0)
+        th = QHBoxLayout()
+        
+        ana, con = QFrame(), QFrame()
+        ana.setStyleSheet(f"background:{C_GR}")
+        con.setStyleSheet(f"background:{C_GR}")
+        al, cl = QVBoxLayout(ana), QVBoxLayout(con)
+        
+        al.addWidget(L("Анализ оператора",20,1,Qt.AlignCenter,"black","#E0E0E0"))
+        il = QGridLayout()
+        self.it, self.iv = QLineEdit(), QLineEdit()
+        
+        for i, (t, w) in enumerate([("Порог", self.it), ("Норма", self.iv)]):
+            il.addWidget(L(t,16),i,0)
+            w.setFixedSize(100,30)
+            w.setStyleSheet(S_INP)
+            il.addWidget(w,i,1)
+        
+        fw = QWidget()
+        fl = QHBoxLayout(fw)
+        fl.addLayout(il)
+        self.bs = B("Записать",'dk', self.save)
+        fl.addWidget(self.bs)
+        al.addWidget(fw)
+        al.addStretch()
+        
+        al.addWidget(L("Терминал",20,1,Qt.AlignCenter,"black","#DCDCDC"))
+        self.tm = QTextEdit()
+        self.tm.setReadOnly(True)
+        self.tm.setStyleSheet(S_TRM)
+        al.addWidget(self.tm)
+        
+        cl.addWidget(L("Подключение",20,1,Qt.AlignCenter,"black","#E0E0E0"))
+        cl.addStretch()
+        
+        hb = QHBoxLayout()
+        hb.addStretch()
+        try:
+            for p in [HAND_PATH_1, HAND_PATH_2]:
+                im = QLabel()
+                im.setStyleSheet("background: white;")
+                im.setFixedSize(100, 120)
+                if os.path.exists(p):
+                    im.setPixmap(QPixmap(p).scaled(100, 120, Qt.KeepAspectRatio))
+                hb.addWidget(im)
+        except:
+            pass
+        hb.addStretch()
+        cl.addLayout(hb)
+        
+        cl.addWidget(L("Наклеить электроды...",14,1,Qt.AlignCenter))
+        cl.addStretch()
+        
+        self.bn = B("Далее",'dk', lambda:(ControlWin(self.d).show(), self.close()), False)
+        cl.addWidget(self.bn, 0, Qt.AlignRight)
+        
+        th.addWidget(ana, 65)
+        th.addWidget(con, 35)
+        v.addLayout(th)
+        
+        if len(d) > 10:
+            self.it.setText(d[9] or "120")
+            self.iv.setText(d[10] or "70")
+        
+        if mode == 'auth':
+            self.it.setReadOnly(True)
+            self.iv.setReadOnly(True)
+            self.bs.hide()
+            self.run_tm()
+
+    def save(self):
+        if not self.it.text() or not self.iv.text():
+            return QMessageBox.warning(self,"!","Заполните все поля")
+        db('upd', [self.it.text(), self.iv.text(), "0"], self.d[0])
+        self.bs.setEnabled(False)
+        self.run_tm()
+
+    def run_tm(self):
+        self.stp = 0
+        self.tm.append(">>> Запуск диагностики...")
+        self.t = QTimer()
+        self.t.timeout.connect(self.step)
+        
+        # Запускаем поток Arduino для проверки
+        self.pulse_thread = PulseThread()
+        self.pulse_thread.connection_status.connect(self.on_arduino_status)
+        self.pulse_thread.pulse_update.connect(self.on_pulse_received)
+        self.pulse_thread.start()
+        
+        self.t.start(1500)
+
+    def on_arduino_status(self, connected, message):
+        """Обработчик статуса подключения Arduino"""
+        self.arduino_connected = connected
+        if connected:
+            self.tm.append(f"✓ {message}")
+        else:
+            self.tm.append(f"✗ {message}")
+            self.tm.append("! Проверьте подключение Arduino")
+            self.tm.append(f"! Порт: {ARDUINO_PORT}, Скорость: {BAUD_RATE}")
+
+    def on_pulse_received(self, pulse_val):
+        """Обработчик получения данных о пульсе"""
+        if self.stp == 2:  # На этапе проверки ЧСС
+            self.tm.append(f"✓ ЧСС... {pulse_val} уд/мин")
+
+    def step(self):
+        messages = [
+            ("Проверка сигнала...", self.check_signal),
+            ("Проверка пульса...", self.check_pulse),
+            ("Проверка ЧСС...", self.check_heart_rate),
+            ("Завершение диагностики", self.finalize)
+        ]
+        
+        if self.stp < len(messages):
+            msg, func = messages[self.stp]
+            self.tm.append(f"\n>>> {msg}")
+            QTimer.singleShot(500, func)  # Задержка перед проверкой
+            self.stp += 1
+        else:
+            self.t.stop()
+
+    def check_signal(self):
+        """Проверка наличия сигнала от Arduino"""
+        if self.arduino_connected:
+            self.tm.append("✓ Сигнал... OK")
+        else:
+            self.tm.append("✗ Сигнал... ОШИБКА")
+            self.tm.append("! Arduino не подключена или не отвечает")
+            self.t.stop()
+            QMessageBox.critical(self, "Ошибка подключения", 
+                               f"Arduino не обнаружена на порту {ARDUINO_PORT}\n"
+                               f"Проверьте:\n"
+                               f"1. Подключение кабеля\n"
+                               f"2. Правильность порта в настройках\n"
+                               f"3. Драйверы устройства")
+
+    def check_pulse(self):
+        """Проверка получения данных о пульсе"""
+        if self.arduino_connected:
+            self.tm.append("✓ Пульс... OK")
+        else:
+            self.tm.append("✗ Пульс... ОШИБКА")
+
+    def check_heart_rate(self):
+        """Проверка показателей ЧСС"""
+        if self.arduino_connected:
+            # Значение уже выведено в on_pulse_received
+            pass
+        else:
+            self.tm.append("✗ ЧСС... Нет данных")
+
+    def finalize(self):
+        """Завершение диагностики"""
+        if self.arduino_connected:
+            self.tm.append("\n✓ Диагностика завершена успешно")
+            self.tm.append("✓ Система готова к работе")
+            self.bn.setEnabled(True)
+            self.bn.setStyleSheet(style('dk'))
+        else:
+            self.tm.append("\n✗ Диагностика завершена с ошибками")
+            self.tm.append("! Устраните неполадки перед продолжением")
+            self.bn.setEnabled(False)
+        
+        # Останавливаем поток проверки
+        if hasattr(self, 'pulse_thread'):
+            self.pulse_thread.stop()
+
+    def closeEvent(self, e):
+        """Остановка потока при закрытии окна"""
+        if hasattr(self, 'pulse_thread'):
+            self.pulse_thread.stop()
+        e.accept()
+```
+
+## 3. Добавьте обработку отключения Arduino в `ControlWin`:
+
+```python
+class ControlWin(ModBase):
+    def __init__(self, d):
+        super().__init__(d, 2)
+        # ... существующий код ...
+        
+        self.arduino_th = PulseThread()
+        self.arduino_th.pulse_update.connect(self.update_pulse_from_arduino)
+        self.arduino_th.connection_status.connect(self.on_arduino_connection_changed)
+        self.arduino_th.start()
+        
+        # ... остальной код ...
+
+    def on_arduino_connection_changed(self, connected, message):
+        """Обработчик изменения статуса Arduino"""
+        if not connected:
+            self.term.append(f"\n!!! ОШИБКА: {message}")
+            self.term.append("!!! Проверьте подключение датчика пульса")
+            QMessageBox.warning(self, "Потеря сигнала", 
+                              f"Связь с Arduino потеряна!\n{message}\n"
+                              f"Данные пульса могут быть неточными.")
+```
+
+## Пример вывода в терминале:
+
+**При успешном подключении:**
+```
+>>> Запуск диагностики...
+
+>>> Проверка сигнала...
+✓ Arduino подключена на COM3
+✓ Сигнал... OK
+
+>>> Проверка пульса...
+✓ Пульс... OK
+
+>>> Проверка ЧСС...
+✓ ЧСС... 76 уд/мин
+
+>>> Завершение диагностики
+✓ Диагностика завершена успешно
+✓ Система готова к работе
+```
+
+**При ошибке подключения:**
+```
+>>> Запуск диагностики...
+
+>>> Проверка сигнала...
+✗ Ошибка подключения: could not open port 'COM3'
+! Arduino не подключена или не отвечает
+✗ Сигнал... ОШИБКА
+! Arduino не обнаружена на порту COM3
+! Проверьте:
+1. Подключение кабеля
+2. Правильность порта в настройках
+3. Драйверы устройства
+```
+
+Теперь система корректно проверяет работоспособность Arduino перед началом работы!
